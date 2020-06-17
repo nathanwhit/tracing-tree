@@ -26,6 +26,19 @@ struct Data {
 struct FmtEvent<'a> {
     stdout: io::StdoutLock<'a>,
     comma: bool,
+    buf: String,
+}
+
+impl<'a> FmtEvent<'a> {
+    fn print(&mut self, indent: usize, indent_amount: usize) {
+        let sub_idt = String::from(" ").repeat(indent * indent_amount);
+        let wrapper = textwrap::Wrapper::new(std::usize::MAX).subsequent_indent(&sub_idt);
+        let wrapped = wrapper.wrap(&self.buf);
+        for w in &wrapped[0..wrapped.len() - 1] {
+            writeln!(self.stdout, "{}", w).unwrap();
+        }
+        write!(self.stdout, "{}", wrapped[wrapped.len() - 1]).unwrap();
+    }
 }
 
 impl Data {
@@ -47,18 +60,19 @@ impl Visit for Data {
 
 impl<'a> Visit for FmtEvent<'a> {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        use fmt::Write;
         write!(
-            &mut self.stdout,
+            &mut self.buf,
             "{comma} ",
             comma = if self.comma { "," } else { "" },
         )
         .unwrap();
         let name = field.name();
         if name == "message" {
-            write!(&mut self.stdout, "{:?}", value).unwrap();
+            write!(&mut self.buf, "{:?}", value).unwrap();
             self.comma = true;
         } else {
-            write!(&mut self.stdout, "{}={:?}", name, value).unwrap();
+            write!(&mut self.buf, "{}={:?}", name, value).unwrap();
             self.comma = true;
         }
     }
@@ -101,12 +115,13 @@ impl HierarchicalLayer {
         }
     }
 
-    fn print_kvs<'a, I, K, V>(
+    fn append_kvs<'a, I, K, V>(
         &self,
-        writer: &mut impl io::Write,
+        // writer: &mut impl io::Write,
+        buf: &mut impl fmt::Write,
         kvs: I,
         leading: &str,
-    ) -> io::Result<()>
+    ) -> fmt::Result
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str> + 'a,
@@ -115,7 +130,7 @@ impl HierarchicalLayer {
         let mut kvs = kvs.into_iter();
         if let Some((k, v)) = kvs.next() {
             write!(
-                writer,
+                buf,
                 "{}{}={}",
                 leading,
                 // Style::new().fg(Color::Purple).bold().paint(k.as_ref()),
@@ -125,12 +140,23 @@ impl HierarchicalLayer {
         }
         for (k, v) in kvs {
             write!(
-                writer,
+                buf,
                 ", {}={}",
                 // Style::new().fg(Color::Purple).bold().paint(k.as_ref()),
                 k.as_ref(),
                 v
             )?;
+        }
+        Ok(())
+    }
+
+    fn print(&self, writer: &mut impl io::Write, buf: &str, indent: usize) -> io::Result<()> {
+        let idt = String::from(" ").repeat(indent * self.indent_amount);
+        let wrapper = textwrap::Wrapper::new(std::usize::MAX)
+            .initial_indent(&idt)
+            .subsequent_indent(&idt);
+        for w in wrapper.wrap_iter(&buf) {
+            writeln!(writer, "{}", w)?;
         }
         Ok(())
     }
@@ -160,41 +186,48 @@ where
         let data = ext.get::<Data>().expect("span does not have data");
 
         let indent = ctx.scope().collect::<Vec<_>>().len() - 1;
-        self.print_indent(&mut stdout, indent)
-            .expect("Unable to write to stdout");
+        // self.print_indent(&mut stdout, indent)
+        //     .expect("Unable to write to stdout");
+
+        let mut buf = String::new();
+
+        use fmt::Write;
 
         write!(
-            &mut stdout,
+            &mut buf,
             "{name}",
             name = self.styled(Style::new().fg(Color::Green).bold(), span.metadata().name())
         )
         .unwrap();
         write!(
-            &mut stdout,
+            &mut buf,
             "{}",
             self.styled(Style::new().fg(Color::Green).bold(), "{") // Style::new().fg(Color::Green).dimmed().paint("{")
         )
         .unwrap();
-        self.print_kvs(&mut stdout, data.kvs.iter().map(|(k, v)| (k, v)), "")
+        self.append_kvs(&mut buf, data.kvs.iter().map(|(k, v)| (k, v)), "")
             .unwrap();
         write!(
-            &mut stdout,
+            &mut buf,
             "{}",
             self.styled(Style::new().fg(Color::Green).bold(), "}") // Style::new().dimmed().paint("}")
         )
         .unwrap();
-        writeln!(&mut stdout).unwrap();
+        self.print(&mut stdout, &buf, indent).unwrap();
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<S>) {
         let mut stdout = self.stdout.lock();
         // printing the indentation
-        if let Some(_) = ctx.current_span().id() {
+        let indent = if let Some(_) = ctx.current_span().id() {
             // size hint isn't implemented on Scope.
             let indent = ctx.scope().collect::<Vec<_>>().len();
             self.print_indent(&mut stdout, indent)
                 .expect("Unable to write to stdout");
-        }
+            indent
+        } else {
+            0
+        };
 
         // check if this event occurred in the context of a span.
         // if it has, get the start time of this span.
@@ -236,8 +269,10 @@ where
         let mut visitor = FmtEvent {
             stdout,
             comma: false,
+            buf: String::new(),
         };
         event.record(&mut visitor);
+        visitor.print(indent, self.indent_amount);
         writeln!(&mut visitor.stdout).unwrap();
     }
 
