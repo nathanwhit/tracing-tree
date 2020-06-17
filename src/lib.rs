@@ -1,5 +1,6 @@
 use ansi_term::{Color, Style};
 use chrono::{DateTime, Local};
+use std::sync::Mutex;
 use std::{fmt, io, io::Write as _};
 use tracing::{
     field::{Field, Visit},
@@ -16,6 +17,7 @@ pub struct HierarchicalLayer {
     stdout: io::Stdout,
     indent_amount: usize,
     ansi: bool,
+    lck: Mutex<()>,
 }
 
 struct Data {
@@ -31,8 +33,19 @@ struct FmtEvent<'a> {
 
 impl<'a> FmtEvent<'a> {
     fn print(&mut self, indent: usize, indent_amount: usize) {
-        let sub_idt = String::from(" ").repeat(indent * indent_amount);
-        let wrapper = textwrap::Wrapper::new(std::usize::MAX).subsequent_indent(&sub_idt);
+        let mut idt = String::with_capacity(indent * indent_amount);
+        let mut i = 0;
+        while i < (indent * indent_amount) {
+            if i % indent_amount == 0 {
+                idt.push('┃');
+            } else {
+                idt.push(' ');
+            }
+            i += 1;
+        }
+        let wrapper = textwrap::Wrapper::new(200 - idt.len())
+            .subsequent_indent(&idt)
+            .break_words(true);
         let wrapped = wrapper.wrap(&self.buf);
         for w in &wrapped[0..wrapped.len() - 1] {
             writeln!(self.stdout, "{}", w).unwrap();
@@ -100,6 +113,7 @@ impl HierarchicalLayer {
             indent_amount,
             stdout: io::stdout(),
             ansi,
+            lck: Mutex::new(()),
         }
     }
 
@@ -150,11 +164,27 @@ impl HierarchicalLayer {
         Ok(())
     }
 
-    fn print(&self, writer: &mut impl io::Write, buf: &str, indent: usize) -> io::Result<()> {
-        let idt = String::from(" ").repeat(indent * self.indent_amount);
-        let wrapper = textwrap::Wrapper::new(std::usize::MAX)
+    fn print(
+        &self,
+        writer: &mut impl io::Write,
+        buf: &str,
+        indent: usize,
+        name_len: usize,
+    ) -> io::Result<()> {
+        let mut idt = String::with_capacity(indent * self.indent_amount);
+        let mut i = 0;
+        while i < (indent * self.indent_amount) {
+            if i % self.indent_amount == 0 {
+                idt.push('┃');
+            } else {
+                idt.push(' ');
+            }
+            i += 1;
+        }
+        let wrapper = textwrap::Wrapper::new(200 + name_len - idt.len())
             .initial_indent(&idt)
-            .subsequent_indent(&idt);
+            .subsequent_indent(&idt)
+            .break_words(true);
         for w in wrapper.wrap_iter(&buf) {
             writeln!(writer, "{}", w)?;
         }
@@ -162,8 +192,19 @@ impl HierarchicalLayer {
     }
 
     fn print_indent(&self, writer: &mut impl io::Write, indent: usize) -> io::Result<()> {
-        for _ in 0..(indent * self.indent_amount) {
-            write!(writer, " ")?;
+        const LINE: &str = "┣━";
+        let mut i = 0;
+        while i < ((indent - 1) * self.indent_amount) {
+            if i % self.indent_amount == 0 {
+                write!(writer, "┃")?;
+            } else {
+                write!(writer, " ")?;
+            }
+            i += 1;
+        }
+        write!(writer, "{}", LINE)?;
+        for _ in 0..self.indent_amount.saturating_sub(2) / 2 {
+            write!(writer, "━")?;
         }
         Ok(())
     }
@@ -193,10 +234,12 @@ where
 
         use fmt::Write;
 
+        let name = span.metadata().name();
+
         write!(
             &mut buf,
             "{name}",
-            name = self.styled(Style::new().fg(Color::Green).bold(), span.metadata().name())
+            name = self.styled(Style::new().fg(Color::Green).bold(), name)
         )
         .unwrap();
         write!(
@@ -213,7 +256,8 @@ where
             self.styled(Style::new().fg(Color::Green).bold(), "}") // Style::new().dimmed().paint("}")
         )
         .unwrap();
-        self.print(&mut stdout, &buf, indent).unwrap();
+        let _guard = self.lck.lock().unwrap();
+        self.print(&mut stdout, &buf, indent, name.len()).unwrap();
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<S>) {
@@ -272,6 +316,7 @@ where
             buf: String::new(),
         };
         event.record(&mut visitor);
+        let _guard = self.lck.lock();
         visitor.print(indent, self.indent_amount);
         writeln!(&mut visitor.stdout).unwrap();
     }
